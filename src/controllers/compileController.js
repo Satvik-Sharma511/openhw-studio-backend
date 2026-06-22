@@ -5,12 +5,18 @@ import crypto from 'crypto';
 import os from 'os';
 import { fileURLToPath } from 'url';
 
+import { handleESP32Compile } from '../esp32/index.js';
+import { handleSTM32Compile } from '../stm32/index.js';
+import { parseLibrariesTxt } from '../services/libraryTxtParser.js';
+import { ensureLibrariesForCompile } from '../services/dynamicLibraryManager.js';
+import { pruneUniversalCachePool } from '../services/compileCachePruner.js';
+import { enqueueCompile } from '../services/compileQueueManager.js';
+import { getCost } from '../services/resourceManager.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Find arduino-cli locally in the bin directory
-// const ARDUINO_CLI_PATH = path.resolve(__dirname, '../../../bin/arduino-cli.exe');
-const ARDUINO_CLI_PATH = 'arduino-cli';
+const ARDUINO_CLI_PATH = process.env.ARDUINO_CLI_PATH || 'arduino-cli';
 const TEMP_DIR = path.resolve(__dirname, '../../temp');
 const UF2_PAYLOAD_PREFIX = 'UF2BASE64:';
 const COMPILE_RESULT_TTL_MS = Number(process.env.COMPILE_RESULT_TTL_MS || (1000 * 60 * 30));
@@ -18,6 +24,7 @@ const COMPILE_RESULT_CACHE_MAX = Math.max(8, Number(process.env.COMPILE_RESULT_C
 const COMPILE_WORKSPACE_ROOT = path.join(TEMP_DIR, 'compile-workspaces');
 const COMPILE_WORKSPACE_TTL_MS = Number(process.env.COMPILE_WORKSPACE_TTL_MS || (1000 * 60 * 60 * 12));
 const COMPILE_WORKSPACE_MAX = Math.max(8, Number(process.env.COMPILE_WORKSPACE_MAX || 48));
+const PICO_UNO_CACHE_ROOT = path.join(TEMP_DIR, 'pico-uno-compile-cache');
 const DEFAULT_PICO_MICROPYTHON_UF2_SOURCE = String(
     process.env.PICO_MICROPYTHON_UART0_UF2_URL
     || process.env.PICO_MICROPYTHON_UF2_URL
@@ -53,13 +60,13 @@ function stableSourceFiles(files) {
         .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function buildCompileRequestHash({ code, files, sketchName, fqbn, builder }) {
+function buildCompileRequestHash({ code, files, fqbn, builder, libraries_txt }) {
     const payload = {
         code: typeof code === 'string' ? code : '',
         files: stableSourceFiles(files),
-        sketchName: sanitizeSketchName(sketchName || 'sketch'),
         fqbn: String(fqbn || '').trim() || 'arduino:avr:uno',
         builder: String(builder || '').trim() || 'arduino-cli',
+        libraries_txt: String(libraries_txt || '').trim(),
     };
     return crypto.createHash('sha1').update(JSON.stringify(payload)).digest('hex');
 }
@@ -81,29 +88,51 @@ function pruneCompileResultCache() {
 
 function getCompileResultFromCache(requestHash) {
     if (!requestHash) return null;
+    
+    // 1. Try in-memory cache
     pruneCompileResultCache();
-    const hit = compileResultCache.get(requestHash);
-    if (!hit) return null;
+    let hit = compileResultCache.get(requestHash);
+    if (hit) {
+        // Touch for simple LRU behavior.
+        compileResultCache.delete(requestHash);
+        compileResultCache.set(requestHash, hit);
+        return {
+            hex: hit.hex,
+            artifactType: hit.artifactType,
+            artifactName: hit.artifactName,
+            elf: hit.elf,
+            elfName: hit.elfName,
+            gdb: hit.gdb,
+            stdout: hit.stdout,
+            diagnostics: hit.diagnostics || null,
+        };
+    }
 
-    // Touch for simple LRU behavior.
-    compileResultCache.delete(requestHash);
-    compileResultCache.set(requestHash, hit);
-    return {
-        hex: hit.hex,
-        artifactType: hit.artifactType,
-        artifactName: hit.artifactName,
-        elf: hit.elf,
-        elfName: hit.elfName,
-        gdb: hit.gdb,
-        stdout: hit.stdout,
-        diagnostics: hit.diagnostics || null,
-    };
+    // 2. Try on-disk cache
+    const cacheFile = path.join(PICO_UNO_CACHE_ROOT, requestHash, 'result.json');
+    if (fs.existsSync(cacheFile)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+            // Touch mtime to mark it as recently used
+            const now = new Date();
+            fs.utimesSync(cacheFile, now, now);
+            fs.utimesSync(path.dirname(cacheFile), now, now);
+
+            // Populate in-memory cache
+            compileResultCache.set(requestHash, data);
+            return data;
+        } catch {
+            return null;
+        }
+    }
+
+    return null;
 }
 
 function setCompileResultCache(requestHash, payload) {
     if (!requestHash || !payload || !payload.hex) return;
 
-    compileResultCache.set(requestHash, {
+    const data = {
         createdAt: Date.now(),
         hex: payload.hex,
         artifactType: payload.artifactType || null,
@@ -113,8 +142,20 @@ function setCompileResultCache(requestHash, payload) {
         gdb: payload.gdb || null,
         stdout: payload.stdout || '',
         diagnostics: payload.diagnostics || null,
-    });
+    };
+
+    compileResultCache.set(requestHash, data);
     pruneCompileResultCache();
+
+    // Persist to disk and prune
+    try {
+        const cacheDir = path.join(PICO_UNO_CACHE_ROOT, requestHash);
+        fs.mkdirSync(cacheDir, { recursive: true });
+        fs.writeFileSync(path.join(cacheDir, 'result.json'), JSON.stringify(data, null, 2), 'utf8');
+        pruneUniversalCachePool();
+    } catch (e) {
+        console.error('[Compile Cache] Failed to write Pico/Uno cache to disk:', e.message);
+    }
 }
 
 function ensureCompileWorkspace(scopeHash, safeSketchName) {
@@ -892,8 +933,16 @@ async function fetchPicoCircuitPythonUf2Asset() {
     }
 }
 
-export const compileArduinoCode = (req, res) => {
-    const { code, files, sketchName, fqbn, builder } = req.body || {};
+export const compileArduinoCode = async (req, res) => {
+    const { code, files, sketchName, fqbn, builder, target } = req.body || {};
+
+    if (target === 'esp32' || String(fqbn).includes('esp32')) {
+        return handleESP32Compile(req, res);
+    }
+
+    if (target === 'stm32' || String(fqbn).toLowerCase().includes('stm32')) {
+        return handleSTM32Compile(req, res);
+    }
 
     if (!code && (!Array.isArray(files) || files.length === 0)) {
         return sendCompileFailure(
@@ -904,19 +953,21 @@ export const compileArduinoCode = (req, res) => {
         );
     }
 
-    const targetFqbn = typeof fqbn === 'string' && fqbn.trim() ? fqbn.trim() : 'arduino:avr:uno';
+    let targetFqbn = typeof fqbn === 'string' && fqbn.trim() ? fqbn.trim() : 'arduino:avr:uno';
+    
     const normalizedBuilder = String(builder || '').trim() || 'arduino-cli';
     const safeSketchName = sanitizeSketchName(sketchName || 'sketch');
     const requestHash = buildCompileRequestHash({
         code,
         files,
-        sketchName: safeSketchName,
         fqbn: targetFqbn,
         builder: normalizedBuilder,
+        libraries_txt: req.body?.libraries_txt,
     });
 
     const cacheHit = getCompileResultFromCache(requestHash);
     if (cacheHit) {
+        console.log(`[Compile Cache] 🟢 Cache hit! Skipping compilation for target FQBN: ${targetFqbn}`);
         return res.json({ ...cacheHit, cache: 'hit' });
     }
 
@@ -1090,8 +1141,14 @@ pico_add_extra_outputs(firmware)
             '-DPICO_BOARD=pico',
         ];
 
-          const doBuild = (cfgStdout = '', cfgStderr = '') => {
-              execFile('cmake', ['--build', buildDir, '--target', 'firmware', '--config', 'Release'], { cwd: sketchDir, env: cmakeEnv }, (buildErr, buildStdout, buildStderr) => {
+        if (process.platform !== 'win32') {
+            configureArgs.push('-DCMAKE_C_COMPILER_LAUNCHER=ccache');
+            configureArgs.push('-DCMAKE_CXX_COMPILER_LAUNCHER=ccache');
+        }
+
+          enqueueCompile(getCost('pico', 'compile'), () => new Promise((resolve) => {
+              const doBuild = (cfgStdout = '', cfgStderr = '') => {
+                  execFile('cmake', ['--build', buildDir, '--target', 'firmware', '--config', 'Release'], { cwd: sketchDir, env: cmakeEnv }, (buildErr, buildStdout, buildStderr) => {
                   if (buildErr) {
                       console.error('Pico SDK build error:', buildStderr || buildStdout);
                       return sendCompileFailure(
@@ -1144,6 +1201,8 @@ pico_add_extra_outputs(firmware)
                           { error: 'Failed to extract UF2.', details: err?.message || 'UF2 extraction failed.' },
                           { builder: normalizedBuilder, fqbn: targetFqbn, stage: 'artifact' }
                       );
+                  } finally {
+                      resolve();
                   }
               });
           };
@@ -1155,7 +1214,7 @@ pico_add_extra_outputs(firmware)
           execFile('cmake', configureArgs, { cwd: sketchDir, env: cmakeEnv }, (cfgErr, cfgStdout, cfgStderr) => {
               if (cfgErr) {
                   console.error('Pico SDK configure error:', cfgStderr || cfgStdout);
-                  return sendCompileFailure(
+                  sendCompileFailure(
                       res,
                       400,
                       {
@@ -1164,23 +1223,50 @@ pico_add_extra_outputs(firmware)
                       },
                       { builder: normalizedBuilder, fqbn: targetFqbn, stage: 'configure' }
                   );
+                  return resolve();
               }
               doBuild(cfgStdout, cfgStderr);
           });
+          }));
           return;
     }
 
+    // Parse and resolve libraries from the optional libraries_txt field
+    const libraryEntries = parseLibrariesTxt(req.body?.libraries_txt);
+    const libraryPaths   = await ensureLibrariesForCompile(libraryEntries);
+    const libraryFlags   = libraryPaths.flatMap(p => ['--libraries', p]);
+
+    // Determine target
+    const isAVR  = String(targetFqbn).includes('avr');
+
+    // Disabled for AVR and RP2040 because their platform.txt prepends compiler.path directly, which breaks the ccache command.
+    const isRP2040 = String(targetFqbn).includes('rp2040');
+    const useCcache = process.platform !== 'win32' && !isAVR && !isRP2040;
+
+    const ccacheC   = 'arm-none-eabi-gcc';
+    const ccacheCpp = 'arm-none-eabi-g++';
+    const ccacheProps = useCcache ? [
+        '--build-property', `compiler.c.cmd=ccache ${ccacheC}`,
+        '--build-property', `compiler.cpp.cmd=ccache ${ccacheCpp}`,
+    ] : [];
+
+    const COMPILE_CACHE_DIR = path.join(TEMP_DIR, 'arduino-cache');
+    
     const cliArgs = [
         'compile',
         '--fqbn', targetFqbn,
         '--build-path', buildDir,
+        '--jobs', '4',
+        ...ccacheProps,
+        ...libraryFlags,
     ];
 
     cliArgs.push(sketchDir);
 
-      execFile(ARDUINO_CLI_PATH, cliArgs, {
-          env: { ...process.env, CC_CACHE_ENABLED: '1', CCACHE_MAXSIZE: '2G' }
-      }, (error, stdout, stderr) => {
+      enqueueCompile(getCost('uno', 'compile'), () => new Promise((resolve) => {
+          execFile(ARDUINO_CLI_PATH, cliArgs, {
+              env: { ...process.env, CC_CACHE_ENABLED: '1', CCACHE_MAXSIZE: '2G' }
+          }, (error, stdout, stderr) => {
         // Read produced firmware artifact regardless of warnings, but handle hard errors.
         let compiledArtifact = {
             payload: '',
@@ -1211,7 +1297,7 @@ pico_add_extra_outputs(firmware)
         }
 
         if (error) {
-            console.error('Compile error:', stderr || stdout);
+            console.error('Compile error:', error || stdout);
             return sendCompileFailure(
                 res,
                 400,
@@ -1256,9 +1342,67 @@ pico_add_extra_outputs(firmware)
         };
 
         setCompileResultCache(requestHash, responsePayload);
-        return res.json({ ...responsePayload, cache: 'miss' });
-    });
+        res.json({ ...responsePayload, cache: 'miss' });
+        resolve();
+      });
+      }));
 };
+
+function resolveAvrdudeExecutable() {
+    const isWin = os.platform() === 'win32';
+    const exeName = isWin ? 'avrdude.exe' : 'avrdude';
+    const explicitExe = String(process.env.AVRDUDE_PATH || '').trim();
+    if (explicitExe && fs.existsSync(explicitExe)) return explicitExe;
+
+    const dataCandidates = [
+        String(process.env.ARDUINO_DATA_DIR || '').trim(),
+        process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Arduino15') : '',
+        process.env.APPDATA ? path.join(process.env.APPDATA, 'Arduino15') : '',
+    ].filter(Boolean);
+
+    for (const dataDir of dataCandidates) {
+        const toolsRoot = path.join(dataDir, 'packages', 'arduino', 'tools', 'avrdude');
+        if (!fs.existsSync(toolsRoot)) continue;
+
+        const versions = fs.readdirSync(toolsRoot, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => entry.name)
+            .sort((a, b) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }));
+
+        for (const version of versions) {
+            const exePath = path.join(toolsRoot, version, 'bin', exeName);
+            if (fs.existsSync(exePath)) return exePath;
+        }
+    }
+    return exeName; // fallback to PATH
+}
+
+function resolveAvrdudeConf() {
+    const explicit = String(process.env.AVRDUDE_CONF || '').trim();
+    if (explicit && fs.existsSync(explicit)) return explicit;
+
+    const dataCandidates = [
+        String(process.env.ARDUINO_DATA_DIR || '').trim(),
+        process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Arduino15') : '',
+        process.env.APPDATA ? path.join(process.env.APPDATA, 'Arduino15') : '',
+    ].filter(Boolean);
+
+    for (const dataDir of dataCandidates) {
+        const toolsRoot = path.join(dataDir, 'packages', 'arduino', 'tools', 'avrdude');
+        if (!fs.existsSync(toolsRoot)) continue;
+
+        const versions = fs.readdirSync(toolsRoot, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => entry.name)
+            .sort((a, b) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }));
+
+        for (const version of versions) {
+            const confPath = path.join(toolsRoot, version, 'etc', 'avrdude.conf');
+            if (fs.existsSync(confPath)) return confPath;
+        }
+    }
+    return '';
+}
 
 export const flashFirmware = (req, res) => {
     const { port, fqbn, hex, baudRate, resetMethod } = req.body || {};
@@ -1280,13 +1424,50 @@ export const flashFirmware = (req, res) => {
 
     try {
         fs.mkdirSync(flashDir, { recursive: true });
+        
+        if (targetFqbn.toLowerCase().includes('esp32')) {
+            const binFile = path.join(flashDir, `firmware_${flashId}.bin`);
+            const binaryBuffer = Buffer.from(hexContent, 'base64');
+            fs.writeFileSync(binFile, binaryBuffer);
+
+            const args = [
+                '-m', 'esptool',
+                '--port', cleanPort,
+            ];
+            if (Number.isFinite(cleanBaud) && cleanBaud > 0) {
+                args.push('--baud', String(Math.trunc(cleanBaud)));
+            }
+            args.push('write_flash', '-z', '0x0', binFile);
+
+            execFile('python', args, (error, stdout, stderr) => {
+                fs.rm(flashDir, { recursive: true, force: true }, (rmErr) => {
+                    if (rmErr) console.error(`Failed to clean up flash dir: ${flashDir}`, rmErr);
+                });
+
+                if (error) {
+                    console.error('Flash error:', stderr || stdout);
+                    return res.status(400).json({
+                        error: 'Flashing failed',
+                        details: stderr || stdout,
+                    });
+                }
+
+                return res.json({
+                    ok: true,
+                    message: 'Firmware flashed successfully via esptool.',
+                    output: stdout || stderr || '',
+                });
+            });
+            return;
+        }
+
         fs.writeFileSync(hexFile, hexContent, 'utf8');
     } catch (err) {
         console.error('Error creating flash temp files:', err);
         return res.status(500).json({ error: 'Failed to create temporary flash files.' });
     }
 
-    const args = [
+    const execArgs = [
         'upload',
         '--fqbn', targetFqbn,
         '-p', cleanPort,
@@ -1294,30 +1475,31 @@ export const flashFirmware = (req, res) => {
         '--verify',
     ];
 
-    if (Number.isFinite(cleanBaud) && cleanBaud > 0) {
-        args.push('--upload-property', `upload.speed=${Math.trunc(cleanBaud)}`);
-    }
-    if (String(resetMethod || '').toLowerCase() === 'no-rts-dtr') {
-        // Core-dependent, may be ignored by some board packages.
-        args.push('--upload-property', 'upload.disable_flushing=true');
+    const isAvr = targetFqbn.toLowerCase().includes(':avr:');
+    if (!isAvr && Number.isFinite(cleanBaud) && cleanBaud > 0) {
+        execArgs.push('--upload-property', `upload.speed=${Math.trunc(cleanBaud)}`);
     }
 
-    execFile(ARDUINO_CLI_PATH, args, (error, stdout, stderr) => {
+    if (String(resetMethod || '').toLowerCase() === 'no-rts-dtr') {
+        execArgs.push('--upload-property', 'upload.disable_flushing=true');
+    }
+
+    execFile(ARDUINO_CLI_PATH, execArgs, (error, stdout, stderr) => {
         fs.rm(flashDir, { recursive: true, force: true }, (rmErr) => {
             if (rmErr) console.error(`Failed to clean up flash dir: ${flashDir}`, rmErr);
         });
 
         if (error) {
-            console.error('Flash error:', stderr || stdout);
+            console.error('Flash error:', stderr || stdout || error.message);
             return res.status(400).json({
                 error: 'Flashing failed',
-                details: stderr || stdout,
+                details: stderr || stdout || error.message,
             });
         }
 
         return res.json({
             ok: true,
-            message: 'Firmware flashed successfully via bootloader uploader.',
+            message: 'Firmware flashed successfully via arduino-cli.',
             output: stdout || stderr || '',
         });
     });
